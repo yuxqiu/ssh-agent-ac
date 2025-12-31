@@ -1,64 +1,54 @@
-name: Release (Nix)
+name: Release
 
 on:
   push:
     tags:
       - "v*"
 
-jobs:
-  release:
-    name: Build & Release (${{ matrix.system }})
-    runs-on: ${{ matrix.runner }}
+permissions:
+  contents: write
 
+jobs:
+  build-and-release:
+    name: Build & Upload (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux
-          - system: x86_64-linux
+          - platform: x86_64-linux
             runner: ubuntu-latest
-          - system: aarch64-linux
-            runner: ubuntu-latest
-
-          # macOS
-          - system: x86_64-darwin
+          - platform: aarch64-linux
+            runner: ubuntu-24.04-arm
+          - platform: aarch64-darwin
             runner: macos-latest
-          - system: aarch64-darwin
-            runner: macos-latest
-
-          # Windows
-          - system: x86_64-windows
+          - platform: x86_64-windows
             runner: windows-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Nix
-        uses: cachix/install-nix-action@v31
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
 
-      - name: Enable flakes
-        run: |
-          mkdir -p ~/.config/nix
-          echo "experimental-features = nix-command flakes" >> ~/.config/nix/nix.conf
-        shell: bash
-
-      - name: Build release package
-        run: |
-          nix build .#packages.${{ matrix.system }}.ssh-agent-ac
-        shell: bash
+      - name: Build release binary
+        run: cargo build --release
 
       - name: Prepare artifact
+        shell: bash
         run: |
           mkdir dist
-          if [[ "${{ matrix.system }}" == *"windows"* ]]; then
-            cp result/bin/ssh-agent-ac.exe dist/ssh-agent-ac-${{ matrix.system }}.exe
+          BINARY_NAME=ssh-agent-ac
+          if [[ "${{ matrix.platform }}" == *"windows"* ]]; then
+            cp target/release/$BINARY_NAME.exe dist/ssh-agent-ac-${{ matrix.platform }}.exe
           else
-            cp result/bin/ssh-agent-ac dist/ssh-agent-ac-${{ matrix.system }}
+            cp target/release/$BINARY_NAME dist/ssh-agent-ac-${{ matrix.platform }}
           fi
-        shell: bash
 
-      - name: Upload artifact to release
+      - name: Upload binaries to release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
