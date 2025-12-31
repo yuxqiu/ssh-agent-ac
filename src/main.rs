@@ -8,6 +8,7 @@ use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use tokio::signal;
 
 #[cfg(windows)]
 use ssh_agent_lib::agent::NamedPipeListener as Listener;
@@ -98,7 +99,7 @@ impl Agent<Listener> for Proxy {
                 .try_into()
                 .unwrap(),
         )
-        .expect("failed to establish connection to ssh-agent backend");
+        .expect("Failed to establish connection to ssh-agent backend");
 
         ProxySession { backend }
     }
@@ -115,7 +116,7 @@ impl Agent<Listener> for Proxy {
                 .try_into()
                 .unwrap(),
         )
-        .expect("failed to establish connection to ssh-agent backend");
+        .expect("Failed to establish connection to ssh-agent backend");
 
         ProxySession { backend }
     }
@@ -126,12 +127,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // Ensure the parent directory of the socket exists
-    if let Some(parent) = args.socket.parent() {
-        if !parent.exists() {
+    if let Some(parent) = args.socket.parent()
+        && !parent.exists() {
             fs::create_dir_all(parent)?;
             println!("Created directory: {}", parent.display());
         }
-    }
 
     // Clean up old socket if present
     if args.socket.exists() {
@@ -153,6 +153,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn {}: {}", agent_binary.display(), e))?;
+    // openssh's ssh-agent will fork into the background so we can directly reap the child here
+    let exit_status = child
+        .wait()
+        .map_err(|e| format!("Failed to wait {}: {}", agent_binary.display(), e))?;
+    if !exit_status.success() {
+        panic!("ssh-agent returns non-zero exit code");
+    }
 
     // Read the output to extract the real SSH_AUTH_SOCK
     let mut stdout = child.stdout.take().expect("stdout piped");
@@ -169,6 +176,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Real ssh-agent running with socket: {}", real_sock);
     println!("Proxy listening on: {}", args.socket.display());
+
+    let socket_path = args.socket.clone();
+    tokio::spawn(async move {
+        signal::ctrl_c().await.expect("failed to listen for ctrl+c");
+        println!("\nShutting down...");
+
+        // Remove our proxy socket
+        if socket_path.exists() {
+            let _ = fs::remove_file(&socket_path);
+            println!("Removed proxy socket: {}", socket_path.display());
+        }
+
+        std::process::exit(0);
+    });
 
     listen(Listener::bind(&args.socket)?, Proxy::new(real_sock.into())).await?;
     Ok(())
