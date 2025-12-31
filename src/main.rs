@@ -113,7 +113,7 @@ impl Agent<Listener> for Proxy {
         _: &tokio::net::windows::named_pipe::NamedPipeServer,
     ) -> impl Session {
         let backend = connect(
-            Binding::NamedPipe(self.backend_socket_path.into_os_string())
+            Binding::NamedPipe(self.backend_socket_path.clone().into_os_string())
                 .try_into()
                 .unwrap(),
         )
