@@ -148,7 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     cmd.args(&args.agent_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env_clear(); // avoid inheriting SSH_AUTH_SOCK etc.
+        .env_remove("SSH_AUTH_SOCK"); // avoid inheriting SSH_AUTH_SOCK etc.
 
     let mut child = cmd
         .spawn()
