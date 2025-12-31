@@ -16,25 +16,26 @@
       system:
       let
         pkgs = import nixpkgs { inherit system; };
-      in
-      {
-        # Buildable Rust package
-        packages.ssh-agent-ac = pkgs.rustPlatform.buildRustPackage {
+        ssh-agent-ac = pkgs.rustPlatform.buildRustPackage {
           pname = "ssh-agent-ac";
           version = "0.1.0";
           src = self;
           cargoLock.lockFile = ./Cargo.lock;
         };
+      in
+      {
+        # Buildable Rust package
+        packages = {
+          ssh-agent-ac = ssh-agent-ac;
+          default = ssh-agent-ac;
+        };
 
         # Make it runnable with `nix run`
         apps.ssh-agent-ac = {
           type = "app";
-          program = "${self.packages.${system}.ssh-agent-ac}/bin/ssh-agent-ac";
+          program = "${ssh-agent-ac}/bin/ssh-agent-ac";
         };
-
-        # Default package/app for `nix build .` or `nix run .`
-        defaultPackage = self.packages.${system}.ssh-agent-ac;
-        defaultApp = self.apps.ssh-agent-ac;
+        apps.default = self.apps.${system}.ssh-agent-ac;
 
         # Development shell
         devShells.default = pkgs.mkShell {
