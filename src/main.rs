@@ -24,9 +24,7 @@ use ssh_agent_lib::{
 #[command(
     author,
     version,
-    about = "SSH agent wrapper that forces confirm constraint on key additions",
-    trailing_var_arg = true,
-    allow_hyphen_values = true
+    about = "SSH agent wrapper that forces confirm constraint on key additions"
 )]
 struct Args {
     /// Path to the socket to bind to
@@ -38,7 +36,7 @@ struct Args {
     agent_path: Option<PathBuf>,
 
     /// Additional arguments to pass to the real ssh-agent (everything after '--')
-    #[arg(last = true)]
+    #[arg(last = true, allow_hyphen_values = true, hide = true)]
     agent_args: Vec<String>,
 }
 
@@ -127,6 +125,14 @@ impl Agent<Listener> for Proxy {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
+    // Ensure the parent directory of the socket exists
+    if let Some(parent) = args.socket.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent)?;
+            println!("Created directory: {}", parent.display());
+        }
+    }
+
     // Clean up old socket if present
     if args.socket.exists() {
         fs::remove_file(&args.socket)?;
@@ -163,8 +169,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Real ssh-agent running with socket: {}", real_sock);
     println!("Proxy listening on: {}", args.socket.display());
-
-    let _ = std::fs::remove_file(&args.socket); // remove the socket if exists
 
     listen(Listener::bind(&args.socket)?, Proxy::new(real_sock.into())).await?;
     Ok(())
