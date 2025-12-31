@@ -1,0 +1,66 @@
+name: Release (Nix)
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    name: Build & Release (${{ matrix.system }})
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux
+          - system: x86_64-linux
+            runner: ubuntu-latest
+          - system: aarch64-linux
+            runner: ubuntu-latest
+
+          # macOS
+          - system: x86_64-darwin
+            runner: macos-latest
+          - system: aarch64-darwin
+            runner: macos-latest
+
+          # Windows
+          - system: x86_64-windows
+            runner: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+
+      - name: Enable flakes
+        run: |
+          mkdir -p ~/.config/nix
+          echo "experimental-features = nix-command flakes" >> ~/.config/nix/nix.conf
+        shell: bash
+
+      - name: Build release package
+        run: |
+          nix build .#packages.${{ matrix.system }}.ssh-agent-ac
+        shell: bash
+
+      - name: Prepare artifact
+        run: |
+          mkdir dist
+          if [[ "${{ matrix.system }}" == *"windows"* ]]; then
+            cp result/bin/ssh-agent-ac.exe dist/ssh-agent-ac-${{ matrix.system }}.exe
+          else
+            cp result/bin/ssh-agent-ac dist/ssh-agent-ac-${{ matrix.system }}
+          fi
+        shell: bash
+
+      - name: Upload artifact to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

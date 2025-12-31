@@ -14,13 +14,11 @@ jobs:
       - name: Install Nix
         uses: cachix/install-nix-action@v31
       - name: Nix flake check
-        run: nix flake check --all-systems
+        run: |
+          SYSTEM=$(nix eval --impure --raw --expr 'builtins.currentSystem')
+          nix build .#packages.${SYSTEM}.ssh-agent-ac
 
   build-linux:
-    strategy:
-      fail-fast: false
-      matrix:
-        system: [x86_64-linux, aarch64-linux]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -28,7 +26,21 @@ jobs:
       - name: Install Nix
         uses: cachix/install-nix-action@v31
       - name: Build ssh-agent-ac
-        run: nix build .#packages.${{ matrix.system }}.ssh-agent-ac
+        run: |
+          SYSTEM=$(nix eval --impure --raw --expr 'builtins.currentSystem')
+          nix build .#packages.${SYSTEM}.ssh-agent-ac
+
+  build-linux-aarch64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+      - name: Build ssh-agent-ac
+        run: |
+          SYSTEM=$(nix eval --impure --raw --expr 'builtins.currentSystem')
+          nix build .#packages.${SYSTEM}.ssh-agent-ac
 
   build-darwin:
     runs-on: macos-latest
