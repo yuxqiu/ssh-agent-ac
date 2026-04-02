@@ -5,10 +5,11 @@ use ssh_agent_lib::client::connect;
 use ssh_agent_lib::error::AgentError;
 use ssh_agent_lib::proto::{Request, Response};
 use std::fs;
-use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use tokio::signal;
+use tokio::sync::watch;
+use tokio::process::Command;
 
 #[cfg(windows)]
 use ssh_agent_lib::agent::NamedPipeListener as Listener;
@@ -28,28 +29,30 @@ use ssh_agent_lib::{
     about = "SSH agent wrapper that forces confirm constraint on key additions"
 )]
 struct Args {
-    /// Path to the socket to bind to
-    #[arg(short = 's', long = "sock", value_name = "PATH", required = true)]
-    socket: PathBuf,
+    /// Path to the socket to bind to (optional, defaults to a temp path)
+    #[arg(short = 's', long = "sock", value_name = "PATH")]
+    socket: Option<PathBuf>,
 
-    /// Path to the openssh ssh-agent binary (optional, defaults to 'ssh-agent' in PATH)
-    #[arg(short = 'a', long = "agent", value_name = "PATH")]
-    agent_path: Option<PathBuf>,
+    /// Command to run with SSH_AUTH_SOCK redirected through the proxy
+    #[arg(value_name = "BIN")]
+    bin: String,
 
-    /// Additional arguments to pass to the real ssh-agent (everything after '--')
-    #[arg(last = true, allow_hyphen_values = true, hide = true)]
-    agent_args: Vec<String>,
+    /// Arguments for the command
+    #[arg(value_name = "ARGS", trailing_var_arg = true, allow_hyphen_values = true)]
+    bin_args: Vec<String>,
 }
 
 #[derive(Clone)]
 struct Proxy {
     backend_socket_path: PathBuf,
+    fatal_tx: watch::Sender<bool>,
 }
 
 impl Proxy {
-    fn new(backend_socket_path: PathBuf) -> Self {
+    fn new(backend_socket_path: PathBuf, fatal_tx: watch::Sender<bool>) -> Self {
         Self {
             backend_socket_path,
+            fatal_tx,
         }
     }
 }
@@ -94,12 +97,16 @@ impl Session for ProxySession {
 #[cfg(unix)]
 impl Agent<Listener> for Proxy {
     fn new_session(&mut self, _: &tokio::net::UnixStream) -> impl Session {
-        let backend = connect(
-            Binding::FilePath(self.backend_socket_path.clone())
-                .try_into()
-                .unwrap(),
-        )
-        .expect("Failed to establish connection to ssh-agent backend");
+        let binding = Binding::FilePath(self.backend_socket_path.clone())
+            .try_into()
+            .unwrap_or_else(|e| {
+                let _ = self.fatal_tx.send(true);
+                panic!("Failed to create binding for ssh-agent backend: {e}");
+            });
+        let backend = connect(binding).unwrap_or_else(|e| {
+            let _ = self.fatal_tx.send(true);
+            panic!("Failed to establish connection to ssh-agent backend: {e}");
+        });
 
         ProxySession { backend }
     }
@@ -111,12 +118,16 @@ impl Agent<Listener> for Proxy {
         &mut self,
         _: &tokio::net::windows::named_pipe::NamedPipeServer,
     ) -> impl Session {
-        let backend = connect(
-            Binding::NamedPipe(self.backend_socket_path.clone().into_os_string())
-                .try_into()
-                .unwrap(),
-        )
-        .expect("Failed to establish connection to ssh-agent backend");
+        let binding = Binding::NamedPipe(self.backend_socket_path.clone().into_os_string())
+            .try_into()
+            .unwrap_or_else(|e| {
+                let _ = self.fatal_tx.send(true);
+                panic!("Failed to create binding for ssh-agent backend: {e}");
+            });
+        let backend = connect(binding).unwrap_or_else(|e| {
+            let _ = self.fatal_tx.send(true);
+            panic!("Failed to establish connection to ssh-agent backend: {e}");
+        });
 
         ProxySession { backend }
     }
@@ -126,71 +137,99 @@ impl Agent<Listener> for Proxy {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
+    let backend_socket = std::env::var_os("SSH_AUTH_SOCK")
+        .ok_or("Missing SSH_AUTH_SOCK for backend ssh-agent socket.")?;
+    let backend_socket_path = PathBuf::from(backend_socket);
+
+    let socket = args.socket.unwrap_or_else(|| {
+        let mut path = std::env::temp_dir();
+        path.push(format!("ssh-agent-ac-{}.sock", std::process::id()));
+        path
+    });
+
     // Ensure the parent directory of the socket exists
-    if let Some(parent) = args.socket.parent()
+    if let Some(parent) = socket.parent()
         && !parent.exists() {
             fs::create_dir_all(parent)?;
             println!("Created directory: {}", parent.display());
         }
 
     // Clean up old socket if present
-    if args.socket.exists() {
-        fs::remove_file(&args.socket)?;
+    if socket.exists() {
+        fs::remove_file(&socket)?;
     }
 
-    // Determine ssh-agent binary path
-    let agent_binary = args
-        .agent_path
-        .unwrap_or_else(|| PathBuf::from("ssh-agent"));
+    println!("Backend ssh-agent socket: {}", backend_socket_path.display());
+    println!("Proxy listening on: {}", socket.display());
 
-    // Build the command for the real ssh-agent
-    let mut cmd = Command::new(&agent_binary);
-    cmd.args(&args.agent_args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env_remove("SSH_AUTH_SOCK"); // avoid inheriting SSH_AUTH_SOCK etc.
+    let mut cmd = Command::new(&args.bin);
+    cmd.args(&args.bin_args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .env("SSH_AUTH_SOCK", &socket);
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to spawn {}: {}", agent_binary.display(), e))?;
-    // openssh's ssh-agent will fork into the background so we can directly reap the child here
-    let exit_status = child
-        .wait()
-        .map_err(|e| format!("Failed to wait {}: {}", agent_binary.display(), e))?;
-    if !exit_status.success() {
-        panic!("ssh-agent returns non-zero exit code");
-    }
+    let (fatal_tx, mut fatal_rx) = watch::channel(false);
 
-    // Read the output to extract the real SSH_AUTH_SOCK
-    let mut stdout = child.stdout.take().expect("stdout piped");
-    let mut buffer = String::new();
-    stdout.read_to_string(&mut buffer)?;
-
-    let real_sock = buffer
-        .lines()
-        .find(|line| line.starts_with("SSH_AUTH_SOCK="))
-        .and_then(|line| line.split('=').nth(1))
-        .and_then(|s| s.split(';').next())
-        .ok_or_else(|| format!("Failed to parse SSH_AUTH_SOCK from output:\n{}", buffer))?
-        .to_string();
-
-    println!("Real ssh-agent running with socket: {}", real_sock);
-    println!("Proxy listening on: {}", args.socket.display());
-
-    let socket_path = args.socket.clone();
-    tokio::spawn(async move {
-        signal::ctrl_c().await.expect("failed to listen for ctrl+c");
-        println!("\nShutting down...");
-
-        // Remove our proxy socket
-        if socket_path.exists() {
-            let _ = fs::remove_file(&socket_path);
-            println!("Removed proxy socket: {}", socket_path.display());
-        }
-
-        std::process::exit(0);
+    let server_socket = socket.clone();
+    let listener = Listener::bind(&server_socket)?;
+    let server = tokio::spawn(async move {
+        listen(listener, Proxy::new(backend_socket_path, fatal_tx)).await
     });
+    tokio::pin!(server);
 
-    listen(Listener::bind(&args.socket)?, Proxy::new(real_sock.into())).await?;
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            server.abort();
+            if socket.exists() {
+                let _ = fs::remove_file(&socket);
+            }
+            return Err(format!("Failed to spawn {}: {}", args.bin, e).into());
+        }
+    };
+
+    let mut fatal_rx_active = true;
+    let child_status = loop {
+        tokio::select! {
+            status = child.wait() => break status?,
+            result = &mut server => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                if socket.exists() {
+                    let _ = fs::remove_file(&socket);
+                }
+                return Err(format!("Proxy exited unexpectedly: {:?}", result).into());
+            },
+            result = fatal_rx.changed(), if fatal_rx_active => {
+                if result.is_ok() && *fatal_rx.borrow() {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    if socket.exists() {
+                        let _ = fs::remove_file(&socket);
+                    }
+                    return Err("Proxy aborted due to backend connection failure.".into());
+                }
+                if result.is_err() {
+                    fatal_rx_active = false;
+                }
+                continue;
+            },
+            _ = signal::ctrl_c() => {
+                let _ = child.kill().await;
+                break child.wait().await?;
+            }
+        }
+    };
+
+    server.abort();
+    if socket.exists() {
+        let _ = fs::remove_file(&socket);
+    }
+
+    if !child_status.success() {
+        return Err(format!("Command exited with status: {}", child_status).into());
+    }
+
     Ok(())
 }
